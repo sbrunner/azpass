@@ -19,6 +19,8 @@ python3 -m pip install --user azpass
 azpass                                 # List the key vaults
 azpass my-vault                        # List the secrets of a key vault
 azpass my-vault my-secret              # Print the value of a secret
+azpass --search 'db*'                  # Search the secret names of all the vaults
+azpass my-vault --search '*password*'  # Search the secret names of one vault
 azpass my-vault --set my-secret        # Set a secret, the value being asked
 azpass my-vault --rm my-secret         # Delete a secret
 ```
@@ -52,6 +54,7 @@ version, `azpass my-vault my-secret` gives the value back.
 | Option           | Description                                              |
 | ---------------- | -------------------------------------------------------- |
 | `--json`         | Print the full JSON document, like the `az` CLI does     |
+| `--search`       | Search the secret names with a glob                      |
 | `--dry-run`      | Print the equivalent `az` command, without calling Azure |
 | `--subscription` | The subscription to search into                          |
 | `--vault-url`    | The URL of the key vault, for the sovereign clouds       |
@@ -65,6 +68,23 @@ and none was ever used, the tool fails and lists them.
 The key vaults are listed within a single subscription, like
 `az keyvault list` does. The deletion of a secret is a soft delete, purge the
 vault to remove it for good.
+
+### Search
+
+`--search` prints the names of the secrets matching a glob pattern, each one
+prefixed by the key vault holding it:
+
+```console
+$ azpass --search '*db*'
+my-vault	db
+other-vault	read-only-db
+```
+
+The search runs over all the key vaults of the subscription, or over the single
+one given as argument. Only the names are matched: the values are never read,
+Azure does not return them for the list operation. Nothing is printed when no
+secret matches, and the command still succeeds, which makes it easy to use in a
+script.
 
 ### Cache
 
@@ -118,6 +138,15 @@ az keyvault list \
 
 The value of a secret is never printed by a dry run, it is replaced by
 `<hidden>`.
+
+A search over all the key vaults has no single `az` command equivalent, and
+JMESPath knows no glob, so the dry run prints the shell loop, the glob being
+applied by `azpass` itself:
+
+```bash
+$ azpass --search 'db*' --dry-run
+for kv in $(az keyvault list --query '[].name' --output tsv --subscription '<subscription>'); do az keyvault secret list --vault-name "$kv" --query '[].name' --output tsv; done
+```
 
 ## Authentication
 

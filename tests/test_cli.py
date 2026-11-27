@@ -335,6 +335,8 @@ def test_dry_run_never_calls_azure(azure, monkeypatch):
     monkeypatch.setattr(cli, "DefaultAzureCredential", boom)
     for argv in (["--dry-run"], ["my-kv", "--dry-run"], ["my-kv", "db", "--dry-run"]):
         assert cli.main(argv) == 0
+    assert cli.main(["my-kv", "--search", "db", "--dry-run"]) == 0
+    assert cli.main(["--search", "db", "--dry-run"]) == 0
     assert cli.main(["my-kv", "--set", "db", "--dry-run"]) == 0
     assert cli.main(["my-kv", "--rm", "db", "--dry-run"]) == 0
     azure.readouterr()
@@ -432,6 +434,87 @@ def test_list_secrets_json(azure):
         "managed": False,
     }
     assert "value" not in secrets[0]
+
+
+def test_dry_run_search_one_vault(azure):
+    """The dry run of a search in one vault prints the az list command."""
+    assert cli.main(["my-kv", "--search", "db*", "--dry-run"]) == 0
+    assert (
+        azure.readouterr().out
+        == "az keyvault secret list --vault-name my-kv --query '[].name' --output tsv\n"
+    )
+
+
+def test_dry_run_search_all_vaults(azure):
+    """The dry run of a search without vault prints the equivalent shell loop."""
+    assert cli.main(["--search", "db*", "--dry-run"]) == 0
+    assert azure.readouterr().out == (
+        "for kv in $(az keyvault list --query '[].name' --output tsv --subscription '<subscription>'); "
+        "do az keyvault secret list --vault-name \"$kv\" --query '[].name' --output tsv; "
+        "done\n"
+    )
+
+
+def test_search_all_vaults(azure):
+    """The search without key vault looks into every vault of the subscription."""
+    FakeKeyVaultManagementClient.vaults = FakeVaultsOperations([FakeVault(), FakeVault(name="other-kv")])
+    assert cli.main(["--search", "*b"]) == 0
+    assert azure.readouterr().out == "my-kv\tdb\nother-kv\tdb\n"
+    content = state.read_json(state.state_file())
+    assert content["vaults"] == {"my-kv": VAULT_URL, "other-kv": VAULT_URL}
+
+
+def test_search_one_vault(azure):
+    """The search can be limited to a key vault."""
+    assert cli.main(["my-kv", "--search", "oth*"]) == 0
+    assert azure.readouterr().out == "my-kv\tother\n"
+
+
+def test_search_json(azure):
+    """The JSON output of the search holds the vault of every secret, never a value."""
+    assert cli.main(["my-kv", "--search", "db", "--json"]) == 0
+    secrets = json.loads(azure.readouterr().out)
+    assert len(secrets) == 1
+    assert secrets[0]["vault"] == "my-kv"
+    assert secrets[0]["id"] == "https://my-kv.vault.azure.net/secrets/db"
+    assert secrets[0]["attributes"]["created"] == CREATED_EPOCH
+    assert "value" not in secrets[0]
+
+
+def test_search_without_result(azure):
+    """No match is an empty output, not a failure."""
+    assert cli.main(["my-kv", "--search", "zzz"]) == 0
+    assert azure.readouterr().out == ""
+
+
+def test_search_never_reads_the_values(azure, monkeypatch):
+    """The search only uses the names returned by the list operation."""
+
+    class NoValues(FakeSecretClient):
+        def get_secret(self, name: str) -> FakeSecret:
+            raise AssertionError("the search must not read the values")
+
+    monkeypatch.setattr(cli, "SecretClient", NoValues)
+    assert cli.main(["my-kv", "--search", "db"]) == 0
+    assert azure.readouterr().out == "my-kv\tdb\n"
+
+
+def test_search_and_key_are_exclusive(azure):
+    """The key cannot be given as an argument and as a search pattern."""
+    with pytest.raises(SystemExit):
+        cli.main(["my-kv", "db", "--search", "db"])
+
+
+def test_search_and_set_are_exclusive(azure):
+    """The search cannot be mixed with a set."""
+    with pytest.raises(SystemExit):
+        cli.main(["my-kv", "--search", "db", "--set", "other"])
+
+
+def test_search_and_rm_are_exclusive(azure):
+    """The search cannot be mixed with a deletion."""
+    with pytest.raises(SystemExit):
+        cli.main(["my-kv", "--search", "db", "--rm", "other"])
 
 
 def test_get_secret(azure):
