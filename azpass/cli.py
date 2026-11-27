@@ -5,6 +5,7 @@ Command line interface to Azure Key Vault.
 """
 
 import argparse
+import fnmatch
 import getpass
 import json
 import logging
@@ -33,12 +34,14 @@ from azure.mgmt.resource.subscriptions.models import Subscription
 
 from azpass.state import Cache
 
-Operation = Literal["vaults", "secrets", "get", "set", "rm"]
+Operation = Literal["vaults", "secrets", "get", "set", "rm", "search"]
 
 DEFAULT_DNS_SUFFIX: Final = "vault.azure.net"
 SUBSCRIPTION_ENV_VAR: Final = "AZURE_SUBSCRIPTION_ID"
 SUBSCRIPTION_PLACEHOLDER: Final = "<subscription>"
 VALUE_PLACEHOLDER: Final = "<hidden>"
+VAULT_VARIABLE: Final = "$kv"
+"""The shell variable the search loop names the key vaults with."""
 
 VAULTS_QUERY: Final = "[].{name:name,rg:resourceGroup,url:properties.vaultUri}"
 SECRETS_QUERY: Final = "[].name"
@@ -69,6 +72,12 @@ class SecretItem(TypedDict):
     tags: dict[str, str] | None
 
 
+class SearchedItem(SecretItem):
+    """A secret entry of the search output, with its key vault."""
+
+    vault: str
+
+
 class SecretValue(SecretItem):
     """A secret entry of a ``az keyvault secret show`` JSON document."""
 
@@ -84,7 +93,12 @@ class DeletedItem(SecretItem):
 
 
 class Plan(TypedDict):
-    """What the user asked for, enough to print the ``az`` command without Azure."""
+    """
+    What the user asked for, enough to print the ``az`` command without Azure.
+
+    The ``key`` holds the name of the secret, or the glob of the search when the
+    operation is ``search``.
+    """
 
     operation: Operation
     vault: str | None
@@ -286,6 +300,25 @@ def _listed_item(properties: SecretProperties) -> SecretItem:
     }
 
 
+def _searched_item(vault: str, properties: SecretProperties) -> SearchedItem:
+    """
+    Build the JSON representation of a searched secret, with its key vault.
+
+    The search runs over many key vaults, so the name of the vault is added to the
+    document, which is the only way to tell where the secret lives.
+
+    :param vault: The name of the key vault holding the secret.
+    :param properties: The properties of the secret, as returned by the SDK.
+    :return: A dictionary shaped like the ``az`` CLI output, plus the vault.
+    """
+    return {
+        "vault": vault,
+        "id": properties.id,
+        "attributes": _attributes(properties),
+        "tags": properties.tags,
+    }
+
+
 def _secret_item(secret: KeyVaultSecret) -> SecretValue:
     """
     Build the JSON representation of a secret with its value.
@@ -360,6 +393,7 @@ AZ_SUBCOMMANDS: Final[dict[Operation, str]] = {
     "get": "show",
     "set": "set",
     "rm": "delete",
+    "search": "list",
 }
 """The ``az keyvault secret`` subcommand of every operation."""
 
@@ -370,6 +404,9 @@ AZ_QUERIES: Final[dict[Operation, str]] = {
     # it was typed and is not printed back.
     "set": ID_QUERY,
     "rm": ID_QUERY,
+    # The glob itself is applied by azpass, JMESPath has no globbing, the printed
+    # command lists all the names.
+    "search": SECRETS_QUERY,
 }
 """The JMESPath query of the human readable output of every operation."""
 
@@ -395,7 +432,7 @@ def _secret_arguments(plan: Plan) -> list[str]:
     :return: The arguments of the command.
     """
     arguments = ["--vault-name", str(plan["vault"])]
-    if plan["operation"] != "secrets":
+    if plan["operation"] in ("get", "set", "rm"):
         arguments.extend(["--name", str(plan["key"])])
     if plan["operation"] == "set":
         # The value is never passed on the command line, it comes from the terminal
@@ -435,6 +472,46 @@ def build_az_command(plan: Plan) -> list[str]:
     ]
 
 
+def build_search_loop(plan: Plan) -> str:
+    """
+    Build the shell loop listing the secrets of every key vault of the subscription.
+
+    Neither Azure nor JMESPath search the names across the key vaults with a glob,
+    so the dry run of a search without key vault prints the loop azpass emulates:
+    the vault names feed the secret list, the glob itself is applied by azpass.
+
+    :param plan: What the user asked for.
+    :return: The shell loop, as a single string.
+    """
+    subscription = plan["subscription"]
+    vaults = shlex.join(
+        [
+            "az",
+            "keyvault",
+            "list",
+            "--query",
+            SECRETS_QUERY,
+            "--output",
+            "tsv",
+            "--subscription",
+            subscription or SUBSCRIPTION_PLACEHOLDER,
+        ]
+    )
+    secrets = shlex.join(
+        [
+            "az",
+            *([] if subscription is None else ["--subscription", subscription]),
+            "keyvault",
+            "secret",
+            "list",
+            "--vault-name",
+            VAULT_VARIABLE,
+            *_printing(plan, SECRETS_QUERY),
+        ]
+    ).replace(shlex.quote(VAULT_VARIABLE), f'"{VAULT_VARIABLE}"')
+    return f"for kv in $({vaults}); do {secrets}; done"
+
+
 def build_parser() -> argparse.ArgumentParser:
     """
     Build the argument parser.
@@ -449,6 +526,8 @@ def build_parser() -> argparse.ArgumentParser:
   azpass                                   List the key vaults
   azpass my-vault                          List the secrets of a key vault
   azpass my-vault my-secret                Print the value of a secret
+  azpass --search 'db*'                    Search the secret names of all the vaults
+  azpass my-vault --search '*password*'    Search the secret names of one vault
   azpass my-vault --set my-secret          Set a secret, the value being asked
   echo hunter2 | azpass my-vault --set my-secret
                                            Set a secret read from a pipe
@@ -473,6 +552,12 @@ secret for good.
         dest="rm_key",
         metavar="KEY",
         help="delete a secret (soft delete)",
+    )
+    parser.add_argument(
+        "--search",
+        dest="search_pattern",
+        metavar="PATTERN",
+        help="search the secret names with a glob, in the given key vault or in all of them",
     )
     parser.add_argument(
         "--json",
@@ -514,7 +599,16 @@ def make_plan(args: argparse.Namespace) -> Plan:
     """
     parser = build_parser()
     key = args.key
-    if args.set_key is not None or args.rm_key is not None:
+    if args.search_pattern is not None:
+        if args.set_key is not None:
+            parser.error("--search and --set are exclusive")
+        if args.rm_key is not None:
+            parser.error("--search and --rm are exclusive")
+        if args.key is not None:
+            parser.error("the KEY argument and --search are exclusive")
+        key = args.search_pattern
+        operation: Operation = "search"
+    elif args.set_key is not None or args.rm_key is not None:
         if args.set_key is not None and args.rm_key is not None:
             parser.error("--set and --rm are exclusive")
         if args.key is not None:
@@ -523,7 +617,7 @@ def make_plan(args: argparse.Namespace) -> Plan:
             parser.error("--set and --rm require the KEYVAULT argument")
         if args.set_key is not None:
             key = args.set_key
-            operation: Operation = "set"
+            operation = "set"
         else:
             key = args.rm_key
             operation = "rm"
@@ -734,6 +828,49 @@ def list_secrets(plan: Plan, session: Session) -> int:
     return 0
 
 
+def search_secrets(plan: Plan, session: Session) -> int:
+    """
+    Search the names of the secrets with a glob, in one key vault or in all of them.
+
+    The values are never read, the list operation does not return them, and fetching
+    every one of them would be slow and would expose the secrets. An empty output is
+    the no result case, the command succeeds anyway.
+
+    :param plan: What the user asked for, the key holding the glob.
+    :param session: The cache and the credential of the run.
+    :return: The exit code.
+    """
+    pattern = str(plan["key"])
+    with waiting("contacting Azure"):
+        clients: list[tuple[str, SecretClient]] = []
+        if plan["vault"] is None:
+            subscription = resolve_subscription(session, plan["subscription"])
+            management = KeyVaultManagementClient(session.credential, subscription)
+            for candidate in management.vaults.list_by_subscription():
+                name = candidate.name
+                if name is None:
+                    continue
+                url = _vault_url(candidate)
+                # The next command about one of these vaults will not need the
+                # management plane any more.
+                session.cache.remember_vault_url(name, url)
+                clients.append((name, SecretClient(url, session.credential)))
+        else:
+            clients.append((str(plan["vault"]), _secret_client(plan, session)))
+        found: list[tuple[str, SecretProperties]] = [
+            (vault_name, properties)
+            for vault_name, client in clients
+            for properties in client.list_properties_of_secrets()
+            if fnmatch.fnmatch(str(properties.name), pattern)
+        ]
+    if plan["json_output"]:
+        print_json([_searched_item(vault_name, properties) for vault_name, properties in found])
+        return 0
+    for vault_name, properties in found:
+        print(f"{vault_name}\t{properties.name}")
+    return 0
+
+
 def get_secret(plan: Plan, session: Session) -> int:
     """
     Print the value of a secret.
@@ -828,11 +965,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         # Nothing is sent to Azure on a dry run, no credential, no subscription and
         # no cached answer read or written.
-        print(shlex.join(build_az_command(plan)))
+        if plan["operation"] == "search" and plan["vault"] is None:
+            print(build_search_loop(plan))
+        else:
+            print(shlex.join(build_az_command(plan)))
         return 0
     handlers: dict[Operation, Handler] = {
         "vaults": list_vaults,
         "secrets": list_secrets,
+        "search": search_secrets,
         "get": get_secret,
         "set": set_secret,
         "rm": delete_secret,
