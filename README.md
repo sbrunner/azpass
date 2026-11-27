@@ -55,15 +55,38 @@ version, `azpass my-vault my-secret` gives the value back.
 | `--dry-run`      | Print the equivalent `az` command, without calling Azure |
 | `--subscription` | The subscription to search into                          |
 | `--vault-url`    | The URL of the key vault, for the sovereign clouds       |
+| `--no-cache`     | Ignore and do not update what was remembered of Azure    |
 
 The subscription is taken from `--subscription`, then from the
-`AZURE_SUBSCRIPTION_ID` environment variable, then from the only accessible
-subscription. When several subscriptions are accessible, the tool fails and
-lists them.
+`AZURE_SUBSCRIPTION_ID` environment variable, then from the last one used, then
+from the only accessible subscription. When several subscriptions are accessible
+and none was ever used, the tool fails and lists them.
 
 The key vaults are listed within a single subscription, like
 `az keyvault list` does. The deletion of a secret is a soft delete, purge the
 vault to remove it for good.
+
+### Cache
+
+Asking Azure which subscriptions are accessible, and where a key vault lives,
+costs one or two round trips. The tool therefore remembers:
+
+- the last subscription used, and the URL of the key vaults already resolved, in
+  `$XDG_CONFIG_HOME/azpass/state.json`, which holds no secret at all;
+- the bearer tokens, in `$XDG_CACHE_HOME/azpass/tokens.json`.
+
+Both files are created with the permissions `0600`, for the owner only. The
+tokens are written in clear text and expire on their own, generally within an
+hour: do not use this cache on a machine you do not own, `--no-cache` disables
+it for one command and removing the two files resets it completely.
+
+When Azure refuses a request because of a stale URL or token, with a status `401`,
+`403` or `404`, the remembered answers are dropped and the command is tried once
+again against Azure.
+
+While a command is running, `azpass: contacting Azure` is shown on the terminal
+and erased afterwards. Nothing is written when the standard error is a pipe, and
+the message of a value prompt never reaches the standard output.
 
 ### JSON output
 
@@ -80,15 +103,16 @@ for that operation.
 
 ### Dry run
 
-Nothing is sent to Azure during a dry run, no credential is even required, so
-it works without being logged in. As the subscription is not resolved, it is
-replaced by the `<subscription>` placeholder in the listed key vaults command
-unless `--subscription` or `AZURE_SUBSCRIPTION_ID` gives it:
+Nothing is sent to Azure during a dry run, no credential is even required, so it
+works without being logged in, and no cache file is read or written. As the
+subscription is not resolved, it is replaced by the `<subscription>` placeholder
+in the listed key vaults command unless `--subscription` or
+`AZURE_SUBSCRIPTION_ID` gives it:
 
 ```bash
 $ azpass --dry-run
 az keyvault list \
-  --query '[].{name:name,rg:resourceGroup,url:properties.vaultUrl}' \
+  --query '[].{name:name,rg:resourceGroup,url:properties.vaultUri}' \
   --output tsv --subscription '<subscription>'
 ```
 

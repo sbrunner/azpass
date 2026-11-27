@@ -3,14 +3,16 @@
 """Tests of the command line."""
 
 import json
+import logging
 import shlex
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import pytest
-from azure.core.exceptions import AzureError
+from azure.core.credentials import AccessToken
+from azure.core.exceptions import AzureError, HttpResponseError
 
-from azpass import cli
+from azpass import cli, state
 
 CREATED = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 UPDATED = datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
@@ -21,6 +23,8 @@ CREATED_EPOCH = 1767323045
 UPDATED_EPOCH = 1770091506
 DELETED_EPOCH = 1772600767
 SECRET_ID = "https://my-kv.vault.azure.net/secrets/db/version"
+STALE_URL = "https://old.my-kv.vault.azure.net/"
+TOKEN_VALUE = "aaaa"
 
 
 @dataclass
@@ -175,6 +179,74 @@ class InterruptedSecretClient(FakeSecretClient):
         raise KeyboardInterrupt
 
 
+class FakeResponse:
+    """A fake HTTP response, enough for ``HttpResponseError``."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        self.reason = "Nope"
+
+    def text_content(self) -> None:
+        """Return no body."""
+        return None
+
+
+class StaleUrlSecretClient(FakeSecretClient):
+    """A fake ``SecretClient`` refusing the URL it was given once."""
+
+    failures = 1
+
+    def __init__(self, vault_url: str, credential: object) -> None:
+        super().__init__(vault_url, credential)
+        if StaleUrlSecretClient.failures > 0:
+            StaleUrlSecretClient.failures -= 1
+            raise HttpResponseError("Not Found", response=FakeResponse(404))
+
+
+class RejectingSecretClient(FakeSecretClient):
+    """A fake ``SecretClient`` always refusing."""
+
+    def __init__(self, vault_url: str, credential: object) -> None:
+        super().__init__(vault_url, credential)
+        raise HttpResponseError("Not Found", response=FakeResponse(404))
+
+
+class FakeCredential:
+    """A fake credential counting the token requests."""
+
+    def __init__(self, value: str = TOKEN_VALUE, expires_on: int = 9999999999) -> None:
+        self.calls: list = []
+        self.value = value
+        self.expires_on = expires_on
+
+    def get_token(self, *scopes: str, **kwargs: object):
+        """Return a token."""
+        self.calls.append(scopes)
+        return AccessToken(self.value, self.expires_on)
+
+    def close(self) -> None:
+        """Close."""
+
+
+class FakeStderr:
+    """A fake standard error."""
+
+    def __init__(self, tty: bool = True) -> None:
+        self.written: list = []
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        """Tell if the output is a terminal."""
+        return self.tty
+
+    def write(self, text: str) -> None:
+        """Write a message."""
+        self.written.append(text)
+
+    def flush(self) -> None:
+        """Flush."""
+
+
 class FakeVaultsOperations:
     """A fake ``vaults`` operation."""
 
@@ -218,8 +290,16 @@ class FakeSubscriptionClient:
 
 
 @pytest.fixture
-def azure(monkeypatch, capsys):
-    """Patch all the Azure entry points of the command line."""
+def xdg(monkeypatch, tmp_path):
+    """Put the cache files in a temporary directory, never in the home."""
+    monkeypatch.setenv(state.STATE_VARIABLE, str(tmp_path / "config"))
+    monkeypatch.setenv(state.CACHE_VARIABLE, str(tmp_path / "cache"))
+    return tmp_path
+
+
+@pytest.fixture
+def azure(xdg, monkeypatch, capsys):
+    """Patch all the Azure entry points and put the caches in a temporary directory."""
     FakeSecretClient.calls = []
     FakeSecretClient.set_values = []
     FakeKeyVaultManagementClient.vaults = FakeVaultsOperations([FakeVault()])
@@ -329,7 +409,11 @@ def test_list_secrets(azure):
     """The secrets of a key vault are listed by name."""
     assert cli.main(["my-kv"]) == 0
     assert azure.readouterr().out == "db\nother\n"
-    assert FakeSecretClient.calls == [(VAULT_URL, "credential")]
+    assert len(FakeSecretClient.calls) == 1
+    vault_url, credential = FakeSecretClient.calls[0]
+    assert vault_url == VAULT_URL
+    assert isinstance(credential, cli.CachingCredential)
+    assert credential.fallback == "credential"
 
 
 def test_list_secrets_json(azure):
@@ -615,3 +699,153 @@ def test_epoch():
     """The dates are converted to the timestamps of the az CLI."""
     assert cli._epoch(CREATED) == CREATED_EPOCH
     assert cli._epoch(None) is None
+
+
+def test_state_remembered_after_a_run(azure):
+    """The subscription and the URLs of the vaults are saved for the next run."""
+    assert cli.main(["--subscription", "sub-9"]) == 0
+    azure.readouterr()
+    content = state.read_json(state.state_file())
+    assert content["subscription"] == "sub-9"
+    assert content["vaults"] == {"my-kv": VAULT_URL}
+    mode = state.state_file().stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_cached_url_skips_the_management_plane(azure):
+    """A known vault URL avoids the expensive lookup of the management plane."""
+    state.write_json(state.state_file(), {"vaults": {"my-kv": STALE_URL}})
+    FakeSecretClient.calls = []
+    assert cli.main(["my-kv", "db"]) == 0
+    azure.readouterr()
+    assert FakeKeyVaultManagementClient.subscriptions == []
+    assert FakeSecretClient.calls[0][0] == STALE_URL
+
+
+def test_cached_subscription_skips_the_lookup(azure):
+    """The last subscription used avoids asking the accessible subscriptions."""
+    state.write_json(state.state_file(), {"subscription": "sub-cached"})
+    assert cli.main([]) == 0
+    azure.readouterr()
+    assert FakeKeyVaultManagementClient.subscriptions == ["sub-cached"]
+
+
+def test_no_cache_ignores_the_state(azure):
+    """The flag ignores what was remembered, and does not rewrite it."""
+    state.write_json(state.state_file(), {"vaults": {"my-kv": STALE_URL}, "subscription": "sub-x"})
+    FakeSecretClient.calls = []
+    assert cli.main(["my-kv", "db", "--no-cache"]) == 0
+    azure.readouterr()
+    assert FakeSecretClient.calls[0][0] == VAULT_URL
+    assert state.read_json(state.state_file()) == {"vaults": {"my-kv": STALE_URL}, "subscription": "sub-x"}
+
+
+def test_corrupted_state_is_ignored(azure):
+    """A cache file we cannot read is simply a cache miss."""
+    state.state_file().parent.mkdir(parents=True, exist_ok=True)
+    state.state_file().write_text("{not json at all", encoding="utf-8")
+    assert cli.main(["my-kv", "db"]) == 0
+    assert azure.readouterr().out == "hunter2\n"
+
+
+def test_wrong_types_in_state_are_ignored(azure):
+    """A cache file containing anything does not break the types of the tool."""
+    state.write_json(state.state_file(), {"subscription": 3, "vaults": {"my-kv": 42}})
+    assert cli.main(["my-kv", "db"]) == 0
+    assert azure.readouterr().out == "hunter2\n"
+
+
+def test_stale_url_is_retried_once(azure, monkeypatch):
+    """A refusal of Azure drops the cached answers and is tried once again."""
+    StaleUrlSecretClient.failures = 1
+    state.write_json(state.state_file(), {"vaults": {"my-kv": STALE_URL}, "subscription": "sub-cached"})
+    monkeypatch.setattr(cli, "SecretClient", StaleUrlSecretClient)
+    FakeSecretClient.calls = []
+    assert cli.main(["my-kv", "db"]) == 0
+    azure.readouterr()
+    assert [call[0] for call in FakeSecretClient.calls] == [STALE_URL, VAULT_URL]
+    assert state.read_json(state.state_file()) == {}
+
+
+def test_error_without_cached_answer_is_not_retried(azure, monkeypatch):
+    """Nothing is tried twice when no cached value was used."""
+    monkeypatch.setattr(cli, "SecretClient", RejectingSecretClient)
+    FakeSecretClient.calls = []
+    assert cli.main(["my-kv", "db"]) == 1
+    assert "azpass: error: Not Found" in azure.readouterr().err
+    assert len(FakeSecretClient.calls) == 1
+
+
+def test_token_cache_avoids_the_credential(xdg):
+    """A token which is still valid is read from the disk, not asked again."""
+    credential = FakeCredential()
+    caching = cli.CachingCredential(state.Cache(True), credential)
+    assert caching.get_token("https://vault.azure.net/.default").token == TOKEN_VALUE
+    assert caching.get_token("https://vault.azure.net/.default").token == TOKEN_VALUE
+    assert len(credential.calls) == 1
+    other = cli.CachingCredential(state.Cache(True), FakeCredential())
+    assert other.get_token("https://vault.azure.net/.default").token == TOKEN_VALUE
+    assert state.tokens_file().exists()
+    assert state.tokens_file().stat().st_mode & 0o777 == 0o600
+
+
+def test_expired_token_is_asked_again(xdg):
+    """A token close to its expiry is not used."""
+    cache = state.Cache(True)
+    soon = int(datetime.now(UTC).timestamp()) + state.EXPIRY_MARGIN - 60
+    cache.remember_token("scope", AccessToken("old", soon))
+    credential = FakeCredential(value="new")
+    caching = cli.CachingCredential(cache, credential)
+    assert caching.get_token("scope").token == "new"
+
+
+def test_dry_run_writes_no_file(azure):
+    """A dry run does not even touch the cache."""
+    assert cli.main(["my-kv", "db", "--dry-run"]) == 0
+    assert cli.main(["my-kv", "--set", "db", "--dry-run"]) == 0
+    azure.readouterr()
+    assert not state.state_file().exists()
+    assert not state.tokens_file().exists()
+
+
+def test_empty_value_makes_no_call(azure, monkeypatch):
+    """Giving up the value must not cost a round trip."""
+    monkeypatch.setattr(cli.sys, "stdin", FakeStdin(""))
+    assert cli.main(["my-kv", "--set", "db"]) == 2
+    azure.readouterr()
+    assert FakeSecretClient.calls == []
+    assert FakeKeyVaultManagementClient.subscriptions == []
+
+
+def test_waiting_message_on_a_terminal(monkeypatch):
+    """The message is written, then erased, on a terminal."""
+    stderr = FakeStderr(tty=True)
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+    with cli.waiting("contacting Azure"):
+        pass
+    assert stderr.written == ["azpass: contacting Azure", "\r\033[K"]
+
+
+def test_waiting_message_erased_on_error(monkeypatch):
+    """The message does not stay on the screen when the call fails."""
+    stderr = FakeStderr(tty=True)
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+    with pytest.raises(AssertionError), cli.waiting("contacting Azure"):
+        raise AssertionError
+    assert stderr.written[-1] == "\r\033[K"
+
+
+def test_waiting_silent_on_a_pipe(monkeypatch):
+    """Nothing is written when the standard error is not a terminal."""
+    stderr = FakeStderr(tty=False)
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+    with cli.waiting("contacting Azure"):
+        pass
+    assert stderr.written == []
+
+
+def test_library_logging_is_silenced(azure):
+    """The libraries do not print the error that the command line prints itself."""
+    logging.getLogger("azure").setLevel(logging.NOTSET)
+    assert cli.main(["my-kv", "db"]) == 0
+    assert logging.getLogger("azure").getEffectiveLevel() == logging.CRITICAL
