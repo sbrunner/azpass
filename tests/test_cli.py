@@ -20,6 +20,7 @@ VAULT_URL = "https://my-kv.vault.azure.net/"
 CREATED_EPOCH = 1767323045
 UPDATED_EPOCH = 1770091506
 DELETED_EPOCH = 1772600767
+SECRET_ID = "https://my-kv.vault.azure.net/secrets/db/version"
 
 
 @dataclass
@@ -42,7 +43,7 @@ class FakeProperties:
 class FakeSecret:
     """A fake ``KeyVaultSecret``."""
 
-    id: str = "https://my-kv.vault.azure.net/secrets/db/version"
+    id: str = SECRET_ID
     properties: FakeProperties = field(default_factory=FakeProperties)
     value: str = "hunter2"
 
@@ -111,14 +112,19 @@ class FakeVault:
 class FakeStdin:
     """A fake standard input."""
 
-    def __init__(self, value: str) -> None:
+    def __init__(self, value: str, tty: bool = False) -> None:
         self.value = value
+        self.tty = tty
         self.reads = 0
 
     def read(self) -> str:
         """Read the value."""
         self.reads += 1
         return self.value
+
+    def isatty(self) -> bool:
+        """Tell if the input is a terminal."""
+        return self.tty
 
 
 @dataclass
@@ -134,6 +140,7 @@ class FakeSecretClient:
     """A fake ``SecretClient`` recording the calls."""
 
     calls: list = []
+    set_values: list = []
 
     def __init__(self, vault_url: str, credential: object) -> None:
         FakeSecretClient.calls.append((vault_url, credential))
@@ -151,12 +158,21 @@ class FakeSecretClient:
     def set_secret(self, name: str, value: str) -> FakeSecret:
         """Set a secret."""
         assert name == "db"
+        FakeSecretClient.set_values.append(value)
         return FakeSecret(value=value)
 
     def begin_delete_secret(self, name: str) -> FakePoller:
         """Delete a secret."""
         assert name == "db"
         return FakePoller()
+
+
+class InterruptedSecretClient(FakeSecretClient):
+    """A fake ``SecretClient`` interrupted by the user."""
+
+    def get_secret(self, name: str) -> FakeSecret:
+        """Raise the interruption of the user."""
+        raise KeyboardInterrupt
 
 
 class FakeVaultsOperations:
@@ -205,6 +221,7 @@ class FakeSubscriptionClient:
 def azure(monkeypatch, capsys):
     """Patch all the Azure entry points of the command line."""
     FakeSecretClient.calls = []
+    FakeSecretClient.set_values = []
     FakeKeyVaultManagementClient.vaults = FakeVaultsOperations([FakeVault()])
     FakeKeyVaultManagementClient.subscriptions = []
     FakeSubscriptionsOperations.subscriptions = [FakeSubscription()]
@@ -284,7 +301,11 @@ def test_dry_run_hides_the_value(azure, monkeypatch):
     """The value of a secret is never printed by the dry run."""
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin("top secret"))
     assert cli.main(["my-kv", "--set", "db", "--dry-run"]) == 0
-    assert "top secret" not in azure.readouterr().out
+    out = azure.readouterr().out
+    assert "top secret" not in out
+    assert out == (
+        "az keyvault secret set --vault-name my-kv --name db --value '<hidden>' --query id --output tsv\n"
+    )
 
 
 def test_list_vaults(azure):
@@ -355,26 +376,79 @@ def test_get_secret_json(azure):
 
 
 def test_set_secret_reads_the_standard_input(azure, monkeypatch):
-    """The value of the secret comes from the standard input."""
-    monkeypatch.setattr(cli.sys, "stdin", FakeStdin("hunter2\n"))
+    """The value of the secret comes from a pipe, the identifier is printed."""
+    stdin = FakeStdin("hunter2\n")
+    monkeypatch.setattr(cli.sys, "stdin", stdin)
     assert cli.main(["my-kv", "--set", "db"]) == 0
-    assert azure.readouterr().out == "hunter2\n"
+    assert azure.readouterr().out == f"{SECRET_ID}\n"
+    assert stdin.reads == 1
 
 
 def test_set_secret_keeps_the_inner_ends_of_line(azure, monkeypatch):
-    """Only one trailing end of line is dropped."""
+    """Only one trailing end of line is dropped, the read value is the sent one."""
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin("a\nb\n\n"))
     assert cli.main(["my-kv", "--set", "db"]) == 0
-    assert azure.readouterr().out == "a\nb\n\n"
+    azure.readouterr()
+    assert FakeSecretClient.set_values == ["a\nb\n"]
+
+
+def test_set_secret_asks_the_value_on_a_terminal(azure, monkeypatch):
+    """On a terminal the value is asked without echo, no read is done."""
+    stdin = FakeStdin("", tty=True)
+    prompts = []
+
+    def fake_getpass(prompt, stream):
+        prompts.append((prompt, stream))
+        return "hunter2"
+
+    monkeypatch.setattr(cli.sys, "stdin", stdin)
+    monkeypatch.setattr(cli.getpass, "getpass", fake_getpass)
+    assert cli.main(["my-kv", "--set", "db"]) == 0
+    assert azure.readouterr().out == f"{SECRET_ID}\n"
+    assert prompts == [("azpass: value of the secret 'db' in 'my-kv': ", cli.sys.stderr)]
+    assert stdin.reads == 0
+
+
+def test_set_secret_interruption_on_a_terminal(azure, monkeypatch):
+    """Interrupting the value prompt does not print a traceback."""
+    monkeypatch.setattr(cli.sys, "stdin", FakeStdin("", tty=True))
+
+    def fake_getpass(prompt, stream):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.getpass, "getpass", fake_getpass)
+    assert cli.main(["my-kv", "--set", "db"]) == 130
+    captured = azure.readouterr()
+    assert captured.out == ""
+    assert captured.err == "azpass: interrupted\n"
+
+
+def test_set_secret_end_of_file_on_a_terminal(azure, monkeypatch):
+    """The Ctrl-D given at the prompt is an empty value, not a traceback."""
+    monkeypatch.setattr(cli.sys, "stdin", FakeStdin("", tty=True))
+
+    def fake_getpass(prompt, stream):
+        raise EOFError
+
+    monkeypatch.setattr(cli.getpass, "getpass", fake_getpass)
+    assert cli.main(["my-kv", "--set", "db"]) == 2
+    captured = azure.readouterr()
+    assert captured.out == ""
+    assert captured.err == "azpass: error: no value on the terminal\n"
+
+
+def test_interruption_during_a_call(azure, monkeypatch):
+    """Interrupting a request does not print a traceback either."""
+    monkeypatch.setattr(cli, "SecretClient", InterruptedSecretClient)
+    assert cli.main(["my-kv", "db"]) == 130
+    assert azure.readouterr().err == "azpass: interrupted\n"
 
 
 def test_set_secret_without_value(azure, monkeypatch):
     """An empty standard input is an error."""
     monkeypatch.setattr(cli.sys, "stdin", FakeStdin(""))
-    with pytest.raises(SystemExit) as exception:
-        cli.main(["my-kv", "--set", "db"])
-    assert exception.value.code == 2
-    assert "no value on the standard input" in azure.readouterr().err
+    assert cli.main(["my-kv", "--set", "db"]) == 2
+    assert azure.readouterr().err == "azpass: error: no value on the standard input\n"
 
 
 def test_rm_secret(azure):

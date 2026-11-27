@@ -19,18 +19,33 @@ python3 -m pip install --user azpass
 azpass                                 # List the key vaults
 azpass my-vault                        # List the secrets of a key vault
 azpass my-vault my-secret              # Print the value of a secret
-echo hunter2 | azpass my-vault --set my-secret
-                                       # Set the value of a secret
+azpass my-vault --set my-secret        # Set a secret, the value being asked
 azpass my-vault --rm my-secret         # Delete a secret
 ```
 
-The value of a secret is always read from the standard input, never given as an
-argument: an argument would be visible in the shell history and in the process
-list. A single trailing end of line is dropped, so a value ending with a real
-end of line has to be piped without it, with `printf` for example.
+The value of a secret is never given as an argument: an argument would be visible
+in the shell history and in the process list. On a terminal it is asked without
+echo, and the end of line validates it:
+
+```console
+$ azpass my-vault --set my-secret
+azpass: value of the secret 'my-secret' in 'my-vault': ********
+https://my-vault.vault.azure.net/secrets/my-secret/89a1c00898fc...
+```
+
+It can also be piped, which is the only way to set a value spanning many lines:
+
+```bash
+echo hunter2 | azpass my-vault --set my-secret
+azpass my-vault --set my-cert < my-cert.pem
+```
+
+One trailing end of line is dropped, so a value ending with a real end of line
+has to be piped without it, with `printf` for example.
 
 `--set` creates a new version of the secret, the previous ones remaining
-available until the deletion of the secret.
+available until the deletion of the secret. It prints the identifier of the new
+version, `azpass my-vault my-secret` gives the value back.
 
 ### Options
 

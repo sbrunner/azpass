@@ -5,6 +5,7 @@ Command line interface to Azure Key Vault.
 """
 
 import argparse
+import getpass
 import json
 import os
 import shlex
@@ -116,6 +117,18 @@ class ManySubscriptionsError(AzpassError):
                 for subscription in subscriptions
             )
         )
+
+
+class NoValueError(AzpassError):
+    """No value was given for the secret."""
+
+    def __init__(self, source: str) -> None:
+        """
+        Initialize.
+
+        :param source: Where the value was read from.
+        """
+        super().__init__(f"no value on {source}")
 
 
 def _epoch(moment: datetime | None) -> int | None:
@@ -248,7 +261,9 @@ AZ_SUBCOMMANDS: Final[dict[Operation, str]] = {
 AZ_QUERIES: Final[dict[Operation, str]] = {
     "secrets": SECRETS_QUERY,
     "get": VALUE_QUERY,
-    "set": VALUE_QUERY,
+    # Only the identifier of the new version is printed, the value was hidden when
+    # it was typed and is not printed back.
+    "set": ID_QUERY,
     "rm": ID_QUERY,
 }
 """The JMESPath query of the human readable output of every operation."""
@@ -278,7 +293,8 @@ def _secret_arguments(plan: Plan) -> list[str]:
     if plan["operation"] != "secrets":
         arguments.extend(["--name", str(plan["key"])])
     if plan["operation"] == "set":
-        # The value always comes from the standard input, it is never printed.
+        # The value is never passed on the command line, it comes from the terminal
+        # prompt or from a pipe, and it is never printed.
         arguments.extend(["--value", VALUE_PLACEHOLDER])
     return arguments
 
@@ -328,11 +344,15 @@ def build_parser() -> argparse.ArgumentParser:
   azpass                                   List the key vaults
   azpass my-vault                          List the secrets of a key vault
   azpass my-vault my-secret                Print the value of a secret
+  azpass my-vault --set my-secret          Set a secret, the value being asked
   echo hunter2 | azpass my-vault --set my-secret
-                                           Set the value of a secret
+                                           Set a secret read from a pipe
   azpass my-vault --rm my-secret           Delete a secret
 
-The deletion is a soft delete, purge the vault to remove the secret for good.
+The value of a secret is never given on the command line, it is asked without echo
+or read from the standard input. Setting and deleting print the identifier of the
+secret, not its value. The deletion is a soft delete, purge the vault to remove the
+secret for good.
 """,
     )
     parser.add_argument("vault", metavar="KEYVAULT", nargs="?", help="the key vault")
@@ -341,7 +361,7 @@ The deletion is a soft delete, purge the vault to remove the secret for good.
         "--set",
         dest="set_key",
         metavar="KEY",
-        help="set a secret, its value being read from the standard input",
+        help="set a secret, its value being asked or read from the standard input",
     )
     parser.add_argument(
         "--rm",
@@ -412,21 +432,35 @@ def make_plan(args: argparse.Namespace) -> Plan:
     }
 
 
-def read_value() -> str:
+def read_value(vault: str, key: str) -> str:
     """
-    Read the value of the secret from the standard input.
+    Read the value of the secret.
 
     The value is never passed as an argument, it would be visible in the process
-    list and in the shell history. A single trailing end of line is dropped, so a
-    value ending with a real end of line has to be piped without it.
+    list and in the shell history. On a terminal it is asked without echo and the
+    end of line validates it, a value spanning many lines has then to be piped. On
+    a pipe the whole standard input is read, one trailing end of line being dropped.
 
+    :param vault: The name of the key vault, shown in the prompt.
+    :param key: The name of the secret, shown in the prompt.
     :return: The value of the secret.
     """
-    value = sys.stdin.read()
-    value = value.removesuffix("\n")
+    if sys.stdin.isatty():
+        # The prompt is written on the standard error, the standard output is kept
+        # for the result of the command.
+        prompt = f"azpass: value of the secret '{key}' in '{vault}': "
+        try:
+            value = getpass.getpass(prompt, sys.stderr)
+        except EOFError:
+            # Ctrl-D at the prompt is an end of file, an empty value like the one
+            # given by an end of line.
+            value = ""
+        source = "the terminal"
+    else:
+        value = sys.stdin.read().removesuffix("\n")
+        source = "the standard input"
     if value == "":
-        print("azpass: error: no value on the standard input", file=sys.stderr)
-        raise SystemExit(2)
+        raise NoValueError(source)
     return value
 
 
@@ -593,11 +627,12 @@ def set_secret(plan: Plan, credential: DefaultAzureCredential) -> int:
     :return: The exit code.
     """
     client = _secret_client(plan, credential)
-    secret = client.set_secret(str(plan["key"]), read_value())
+    secret = client.set_secret(str(plan["key"]), read_value(str(plan["vault"]), str(plan["key"])))
     if plan["json_output"]:
         print_json(_secret_item(secret))
     else:
-        print(str(secret.value))
+        # The identifier of the new version, the value is not printed back.
+        print(str(secret.id))
     return 0
 
 
@@ -649,6 +684,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The user has to give a missing parameter, the message is enough.
         print(f"azpass: error: {exception}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        # The user interrupted the command, while typing a value or during a call, an
+        # interruption is not a bug and does not deserve a Python traceback. The exit
+        # code is the conventional 128 + SIGINT.
+        print("azpass: interrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
